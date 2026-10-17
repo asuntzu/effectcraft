@@ -43,10 +43,19 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
-    let mut proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    let (mut proj, repaired) =
+        Project::from_json_repaired(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
     resolve_relative_footage(&mut proj, path, s.services.as_ref());
     s.replace_project(proj, Some(path.to_string()));
+    s.restore_view(&effectcraft_project::saved_view(&text));
     s.note_project_path(path);
+    // Values past the limits (a corrupt or hostile file) were brought within them (#788).
+    if !repaired.is_empty() {
+        let more = repaired.len().saturating_sub(3);
+        let shown = repaired.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        s.toast(format!("This project had values outside EffectCraft's limits, corrected when it opened: {shown}{more}."));
+    }
     // Written by a newer EffectCraft: what this version doesn't know would be lost on saving.
     let saved_by = effectcraft_project::saved_by(&text);
     if let Some(v) = saved_by.as_deref().filter(|v| effectcraft_project::is_newer_version(v, effectcraft_project::APP_VERSION)) {
@@ -60,7 +69,7 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     if s.check_footage_on_open {
         crate::footage_check::start(s, None, false)?;
     }
-    Ok(json!({"path": path, "savedBy": saved_by}))
+    Ok(json!({"path": path, "savedBy": saved_by, "repaired": repaired}))
 }
 
 /// Footage saved with a relative path (imported by the CLI or an agent as `clip.mp4`, or written
@@ -89,7 +98,7 @@ fn resolve_relative_footage(p: &mut Project, project_path: &str, services: &dyn 
 /// project opened from an XML copy saves as XML again). Fails, writing nothing, when the project
 /// wouldn't read back.
 pub(crate) fn file_text(s: &Session, path: &str) -> Result<String> {
-    let json = s.project.to_file_json()?;
+    let json = s.project.to_file_json_with_view(&s.saved_view())?;
     if crate::xml_project::is_xml_path(path) { crate::xml_project::to_xml(&json).map_err(EngineError::Other) } else { Ok(json) }
 }
 
@@ -236,6 +245,8 @@ struct PendingImport {
     comps: Vec<u64>,
     items: Vec<u64>,
     errors: Vec<String>,
+    /// EffectCraft projects merged in (`file.importProject` results); never added to a comp.
+    projects: Vec<Value>,
 }
 
 /// Everything probing a file needs, apart from the session (it can run on a background thread).
@@ -361,10 +372,18 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
             _ => return Err(bad("file.import", "page: a page number from 1")),
         },
     };
-    let mut paths = paths;
     let mut comps = vec![];
     let mut items = vec![];
     let mut errors = vec![];
+    // EffectCraft projects import as projects, as After Effects imports an .aep.
+    let (project_paths, mut paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::import_project::is_project_path(x));
+    let mut projects = vec![];
+    for path in project_paths {
+        match s.execute("file.importProject", json!({"path": path})) {
+            Ok(r) => projects.push(r),
+            Err(e) => errors.push(format!("{path}: {e}")),
+        }
+    }
     if let Some(retain) = retain {
         let mut rest = vec![];
         for path in paths {
@@ -372,7 +391,7 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
                 Ok(b) if effectcraft_psd::is_psd(&b) => b,
                 Ok(b) if effectcraft_pdf::sniff(&b).is_some() && !path.to_ascii_lowercase().ends_with(".svg") => {
                     // PDF / Illustrator / EPS: one layer per file layer.
-                    match import_vector_comp(s, &path, &b, page) {
+                    match import_vector_comp(s, &path, &b, page, retain) {
                         Ok((comp, made)) => {
                             comps.push(comp);
                             items.extend(made);
@@ -415,13 +434,13 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
         page,
         psd_layer: p.get("layer").cloned(),
     };
-    Ok(PendingImport { sources, prober, comps, items, errors })
+    Ok(PendingImport { sources, prober, comps, items, errors, projects })
 }
 
 /// The last part of an import: add the probed files to the project (one undo step) and select
 /// everything the import made, so the Project panel shows it.
 fn add_footage(s: &mut Session, pending: PendingImport, probed: Vec<std::result::Result<Probed, String>>) -> Result<Value> {
-    let PendingImport { comps, mut items, mut errors, .. } = pending;
+    let PendingImport { comps, mut items, mut errors, projects, .. } = pending;
     let mut found = vec![];
     let mut warnings = vec![];
     for r in probed {
@@ -436,6 +455,11 @@ fn add_footage(s: &mut Session, pending: PendingImport, probed: Vec<std::result:
     let mut asked: Vec<u64> = vec![];
     let made: Vec<ItemId> = comps.iter().map(|c| ItemId(*c)).collect();
     if !found.is_empty() {
+        // The file may have been overwritten since an earlier import or project decoded it (the
+        // media layer keys frames by path): a fresh import reads it again (#1070).
+        for f in &found {
+            s.forget_decoded(&f.footage);
+        }
         s.edit("Import", None, |proj, st| {
             let mut selection = made;
             for f in found {
@@ -473,7 +497,11 @@ fn add_footage(s: &mut Session, pending: PendingImport, probed: Vec<std::result:
     if let Some(first) = asked.first() {
         s.events.push(crate::Event::Frontend { command: "file.interpretFootage".into(), params: json!({"item": first, "reason": "unlabeledAlpha"}) });
     }
-    Ok(json!({"items": items, "comps": comps, "errors": errors, "warnings": warnings, "unlabeledAlpha": asked}))
+    let mut out = json!({"items": items, "comps": comps, "errors": errors, "warnings": warnings, "unlabeledAlpha": asked});
+    if !projects.is_empty() {
+        out["projects"] = Value::Array(projects);
+    }
+    Ok(out)
 }
 
 /// Whether a file format states how its alpha is stored (PNG, GIF, WebP and PSD are straight by
@@ -512,7 +540,7 @@ pub(crate) fn import_psd_comp(s: &mut Session, path: &str, bytes: Vec<u8>, retai
 
 /// Import page `page` of a PDF / Illustrator / EPS file as a composition (one undo step).
 /// Returns (comp, items).
-fn import_vector_comp(s: &mut Session, path: &str, bytes: &[u8], page: u32) -> Result<(u64, Vec<u64>)> {
+fn import_vector_comp(s: &mut Session, path: &str, bytes: &[u8], page: u32, retain: bool) -> Result<(u64, Vec<u64>)> {
     let mut name = std::path::Path::new(path).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Vector".into());
     if page > 0 {
         name = format!("{name} (Page {})", page + 1);
@@ -521,7 +549,7 @@ fn import_vector_comp(s: &mut Session, path: &str, bytes: &[u8], page: u32) -> R
     let secs = if s.prefs.import.still_footage == "seconds" { s.prefs.import.still_seconds } else { 10.0 };
     let duration = rate.snap_nearest(effectcraft_time::Tick::from_seconds_f64(secs));
     let (comp, folder, items) = s.edit("Import", None, |proj, st| {
-        let r = crate::vector::import_vector_comp(proj, path, bytes, &name, page, rate, duration).map_err(EngineError::Other)?;
+        let r = crate::vector::import_vector_comp(proj, path, bytes, &name, page, retain, (rate, duration)).map_err(EngineError::Other)?;
         st.project_selection = vec![r.0];
         Ok(r)
     })?;
